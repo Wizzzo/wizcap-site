@@ -1,0 +1,62 @@
+# Free replacement for GitHub auto-merge + required checks (unavailable for private repos on
+# GitHub Free). It merges a PR only when ALL of these are true:
+#   - the PR carries the label `auto`, is open and is not a draft
+#   - its current head commit has a successful `ci` check
+#   - every other check on that commit has finished without failing
+# It re-evaluates whenever CI or the Claude review finishes, or a label is added, so the
+# order of events doesn't matter. Remove the `auto` label to stop it.
+name: Automerge
+
+on:
+  workflow_run:
+    workflows: ["CI", "Claude review"]
+    types: [completed]
+  pull_request:
+    types: [labeled, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  automerge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # A PAT, so the merge commit on main triggers CI/release (GITHUB_TOKEN merges don't).
+      GH_TOKEN: ${{ secrets.STUDIO_GH_TOKEN || github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number }}
+    steps:
+      - name: Merge if labelled `auto` and every check is green
+        run: |
+          set -euo pipefail
+          [ -n "$PR" ] || { echo "No PR for this event."; exit 0; }
+
+          pr=$(gh api "repos/$REPO/pulls/$PR")
+          state=$(jq -r .state <<<"$pr"); draft=$(jq -r .draft <<<"$pr")
+          sha=$(jq -r .head.sha <<<"$pr"); branch=$(jq -r .head.ref <<<"$pr")
+          same_repo=$(jq -r '.head.repo.full_name == .base.repo.full_name' <<<"$pr")
+          has_auto=$(jq -r '[.labels[].name] | index("auto") != null' <<<"$pr")
+
+          if [ "$state" != open ] || [ "$draft" = true ] || [ "$has_auto" != true ] || [ "$same_repo" != true ]; then
+            echo "Skip: state=$state draft=$draft auto=$has_auto same_repo=$same_repo"; exit 0
+          fi
+
+          checks=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+            -q '[.check_runs[] | select(.name != "automerge")]')
+          ci_ok=$(jq '[.[] | select(.name == "ci" and .conclusion == "success")] | length' <<<"$checks")
+          not_ok=$(jq '[.[] | select(.status != "completed" or (.conclusion | IN("success","skipped","neutral") | not))] | length' <<<"$checks")
+          echo "ci_ok=$ci_ok not_ok=$not_ok"
+          if [ "$ci_ok" -lt 1 ] || [ "$not_ok" -gt 0 ]; then
+            echo "Not ready yet; will re-run when the next check finishes."; exit 0
+          fi
+
+          # sha= makes the merge fail if someone pushed after the checks ran.
+          gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$sha" -q .message
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$branch" || true
